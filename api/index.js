@@ -1,75 +1,82 @@
 const axios = require("axios");
 const cheerio = require("cheerio");
 
-async function fetchHTML(url) {
-  return await axios.get(url, {
+async function resolveRedirect(url) {
+  try {
+    const res = await axios.get(url, {
+      maxRedirects: 5,
+      validateStatus: () => true,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      }
+    });
+
+    // axios follow redirect → final URL ada di res.request.res.responseUrl
+    return res.request.res.responseUrl || url;
+  } catch {
+    return url;
+  }
+}
+
+async function extractVideo(url) {
+  const html = await axios.get(url, {
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       "Referer": "https://www.tiktok.com/",
-      "Accept-Language": "en-US,en;q=0.9"
-    }
+    },
   });
-}
 
-function extractVideo(html) {
-  const $ = cheerio.load(html);
+  const $ = cheerio.load(html.data);
 
-  // 1. TikTok format terbaru (script JSON)
-  const script = $("script#__UNIVERSAL_DATA_FOR_REHYDRATION__").html();
-  if (script) {
+  // JSON script TikTok
+  const scripts = $("script[id='SIGI_STATE']").html();
+  if (scripts) {
     try {
-      const json = JSON.parse(script);
+      const json = JSON.parse(scripts);
+
       const videoUrl =
-        json["__DEFAULT_SCOPE__"]?.webapp?.videoDetail?.itemInfo?.itemStruct
-          ?.video?.downloadAddr;
+        json.ItemModule &&
+        Object.values(json.ItemModule)[0]?.video?.downloadAddr;
 
       if (videoUrl) return videoUrl;
     } catch {}
   }
-
-  // 2. OG tags (fallback)
-  const og = $("meta[property='og:video']").attr("content");
-  if (og) return og;
-
-  // 3. video tag (fallback)
-  const vid = $("video").attr("src");
-  if (vid) return vid;
 
   return null;
 }
 
 module.exports = async (req, res) => {
   const { url, download } = req.query;
+
   if (!url) return res.status(400).json({ error: "Missing url" });
 
   try {
-    const response = await fetchHTML(url);
-    const direct = extractVideo(response.data);
+    // FIRST: resolve shortlink
+    const finalUrl = await resolveRedirect(url);
 
-    if (!direct) {
-      return res.status(404).json({ error: "Video not found in page" });
-    }
+    // THEN: extract from real page
+    const direct = await extractVideo(finalUrl);
 
-    // DOWNLOAD MODE
+    if (!direct) return res.status(404).json({ error: "Video not found" });
+
     if (download) {
-      const videoStream = await axios.get(direct, {
+      const stream = await axios.get(direct, {
         responseType: "stream",
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        headers: { "User-Agent": "Mozilla/5.0" },
       });
 
       res.setHeader(
         "Content-Disposition",
-        "attachment; filename=tiktok-video.mp4"
+        'attachment; filename="tiktok.mp4"'
       );
 
-      return videoStream.data.pipe(res);
+      return stream.data.pipe(res);
     }
 
     return res.json({ videoUrl: direct });
+
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
